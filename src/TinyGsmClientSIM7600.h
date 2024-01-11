@@ -212,9 +212,27 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
         : GsmClientSim7600(modem, mux) {}
     
   public:
-    bool setCertificate(const String& certificateName, const uint8_t mux = 0) {
+    bool setCACert(const String &certificateString, const uint8_t mux = 0) {
       if (mux >= TINY_GSM_MUX_COUNT) return false;
-      at->certificates[mux] = certificateName;
+      at->certificates[mux].cacert = certificateString;
+      return true;
+    }
+    
+    bool setCertificate(const String &certificateString, const uint8_t mux = 0) {
+      if (mux >= TINY_GSM_MUX_COUNT) return false;
+      at->certificates[mux].clientcert = certificateString;
+      return true;
+    }
+    
+    bool setPrivateKey(const String &certificateString, const uint8_t mux = 0) {
+      if (mux >= TINY_GSM_MUX_COUNT) return false;
+      at->certificates[mux].clientkey = certificateString;
+      return true;
+    }
+
+    bool forceTCP(bool to=true) {
+      if (mux >= TINY_GSM_MUX_COUNT) return false;
+      at->force_tcp[mux] = to;
       return true;
     }
 
@@ -303,10 +321,11 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     }
 
     virtual int connect(const char* host, uint16_t port, int timeout_s) override {
-      stop();
+    //   stop();
       TINY_GSM_YIELD();
       rx.clear();
       sock_connected = at->modemConnect(host, port, mux, true, timeout_s);
+
       return sock_connected;
     }
     TINY_GSM_CLIENT_CONNECT_OVERRIDES
@@ -525,13 +544,11 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
     sendAT(GF("+NETOPEN"));
     if (waitResponse(75000L, GF(GSM_NL "+NETOPEN: 0")) != 1) { return false; }
     
-
     // Start the SSL client (doesn't mean we have to use it!)
     sendAT(GF("+CCHSET=0,1"));  // Set the module to require manual reading of  rx buffer data.
     waitResponse(5000L);
-    sendAT(GF("+CCHSTART"));  // Start the SSL client
-    if (waitResponse(5000L) != 1) return false;
-    sendAT(GF("+CSSLCFG=\"sslversion\",0,4"));  // TLS 1.2
+    
+    sendAT(GF("+CCHSTART"));  // Start the SSL client (may already be running, doesn't matter!)      
     if (waitResponse(5000L) != 1) return false;
 
     return true;
@@ -793,35 +810,79 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
  protected:
   bool modemConnect(const char* host, uint16_t port, uint8_t mux,
                     bool ssl = false, int timeout_s = 15) {
+        uint32_t timeout_ms = ((uint32_t)timeout_s) * 1000;
     if (ssl)
     {
       // List the certs available
       //   sendAT(GF("+CCERTLIST"));
       //   waitResponse(5000L);
 
-      // List the certs available
-      sendAT(GF("+CCERTDOWN=\"cacert.pem\","), certificates[mux].length());
-      if (waitResponse(GF(">"))) {
-        sendAT(GF(certificates[mux]));
-        waitResponse(5000L);
+      // SSL Version settings
+      sendAT(GF("+CSSLCFG=\"sslversion\",0,4"));  // All versions
+      if (waitResponse(5000L) != 1) return false;
+      
+      // CACERT
+      int mode = 0;
+      if (!certificates[mux].cacert.isEmpty() && certificates[mux].clientcert.isEmpty() ) {
+        mode = 1;
+      } else if (certificates[mux].cacert.isEmpty() && !certificates[mux].clientcert.isEmpty() ) {
+        mode = 3; 
+      } else if (!certificates[mux].cacert.isEmpty() && !certificates[mux].clientcert.isEmpty() ) {
+        mode = 2;
+      }
+      sendAT(GF("+CSSLCFG=\"authmode\","), mux, ',', mode);
+      waitResponse();
+      
+      sendAT(GF("+CSSLCFG=\"ignorelocaltime\","), mux, ',', 0);
+      waitResponse();
+
+      if (!certificates[mux].cacert.isEmpty()) {
+        sendAT(GF("+CCERTDOWN=\"cacert.pem\","), certificates[mux].cacert.length());
+        if (waitResponse(GF(">"))) {
+          stream.write(reinterpret_cast<const uint8_t*>(certificates[mux].cacert.c_str()), certificates[mux].cacert.length());
+          waitResponse(5000L);
+        }
+        sendAT(GF("+CSSLCFG=\"cacert\","), mux, ",\"cacert.pem\"");  // TLS 1.2
+        if (waitResponse(5000L) != 1) return false;
+      } else {
+        sendAT(GF("+CSSLCFG=\"cacert\","), mux, ",\"cacert.pem\"");  // TLS 1.2
       }
 
+      // CLIENTCERT
+      if (!certificates[mux].clientcert.isEmpty()) {
+        sendAT(GF("+CCERTDOWN=\"clientcert.pem\","), certificates[mux].clientcert.length());
+        if (waitResponse(GF(">"))) {
+          stream.write(reinterpret_cast<const uint8_t*>(certificates[mux].clientcert.c_str()), certificates[mux].clientcert.length());
+          waitResponse(5000L);
+        }
+        sendAT(GF("+CSSLCFG=\"clientcert\","), mux, ",\"clientcert.pem\"");  // TLS 1.2
+        if (waitResponse(5000L) != 1) return false;
+      } else {
+        sendAT(GF("+CSSLCFG=\"clientcert\","), mux, ",\"clientcert.pem\"");  // TLS 1.2
+      }
 
-      sendAT(GF("+CSSLCFG=\"cacert\","), mux, ",\"cacert.pem\"");  // TLS 1.2
-      if (waitResponse(5000L) != 1) return false;
-    }
-    // Make sure we'll be getting data manually on this connection
-    sendAT(GF("+CIPRXGET=1"));
-    if (waitResponse() != 1) { return false; }
+      // CLIENTPRIVATEKEY
+      if (!certificates[mux].clientkey.isEmpty()) {
+        sendAT(GF("+CCERTDOWN=\"clientkey.pem\","), certificates[mux].clientkey.length());
+        if (waitResponse(GF(">"))) {
+          stream.write(reinterpret_cast<const uint8_t*>(certificates[mux].clientkey.c_str()), certificates[mux].clientkey.length());
+          waitResponse(5000L);
+        }
+        sendAT(GF("+CSSLCFG=\"clientkey\","), mux, ",\"clientkey.pem\"");  // TLS 1.2
+        if (waitResponse(5000L) != 1) return false;
+      } else {
+        sendAT(GF("+CSSLCFG=\"clientkey\","), mux, ",\"clientkey.pem\"");  // TLS 1.2
+      }
 
     // Establish a connection in multi-socket mode
-    uint32_t timeout_ms = ((uint32_t)timeout_s) * 1000;
-    if (ssl) {
-      sendAT(GF("+CCHOPEN="), mux, ',', GF("\""), host, GF("\","), port);
+      sendAT(GF("+CCHOPEN="), mux, ',', GF("\""), host, GF("\","), port, GF(","), force_tcp[mux]);
       // The reply is OK followed by +CIPOPEN: <link_num>,<err> where <link_num>
       // is the mux number and <err> should be 0 if there's no error
       if (waitResponse(timeout_ms, GF(GSM_NL "+CCHOPEN:")) != 1) { return false; }
     } else {
+    // Make sure we'll be getting data manually on this connection
+      sendAT(GF("+CIPRXGET=1"));
+      if (waitResponse() != 1) { return false; }
       sendAT(GF("+CIPOPEN="), mux, ',', GF("\"TCP"), GF("\",\""), host, GF("\","),
              port);
       // The reply is OK followed by +CIPOPEN: <link_num>,<err> where <link_num>
@@ -988,8 +1049,15 @@ class TinyGsmSim7600 : public TinyGsmModem<TinyGsmSim7600>,
   Stream& stream;
 
  protected:
+  struct cert_bundle {
+    String cacert;
+    String clientcert;
+    String clientkey;
+  };
+
   GsmClientSim7600* sockets[TINY_GSM_MUX_COUNT];
-  String            certificates[TINY_GSM_MUX_COUNT];
+  cert_bundle       certificates[TINY_GSM_MUX_COUNT];
+  bool              force_tcp[TINY_GSM_MUX_COUNT] = {false, false};
   const char*       gsmNL = GSM_NL;
 };
 
